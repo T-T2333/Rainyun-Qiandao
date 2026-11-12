@@ -1,61 +1,143 @@
-name: 同步上游仓库
-
-# 为 Fork 仓库自动同步上游（LeapYa/Rainyun-Qiandao）更新：
-# 大部分 Fork 用户不关注上游，签到代码过期后无人维护。
-# 本 workflow 每天在北京时间 6:30（签到前 15 分钟）检查上游，
-# 有新提交则自动合并并推送到 Fork 的 main，随后当天的签到即使用最新代码。
-# 在上游仓库自身运行时自动跳过。
+name: Sync with upstream
 
 on:
   schedule:
-    - cron: '30 22 * * *'
+    # every 7 days (5, 12, 19, 26; not */7, see note)
+    - cron: '29 3 5,12,19,26 * *'
   workflow_dispatch:
 
 permissions:
   contents: write
 
+# same group as the other maintenance workflow, so two never push at once
+concurrency:
+  group: repo-maintenance
+  cancel-in-progress: false
+
 jobs:
   sync:
+    if: github.repository == 'T-T2333/Rainyun-Qiandao'
     runs-on: ubuntu-latest
-    # 上游仓库自身无需同步（只有 Fork 才需要）
-    if: github.repository != 'LeapYa/Rainyun-Qiandao'
+
     steps:
-      - name: 检出代码（完整历史，合并需要）
-        uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
-      - name: 同步上游
+      - name: Align main with upstream
+        env:
+          UPSTREAM_REPO: LeapYa/Rainyun-Qiandao
+          UPSTREAM_BRANCH: main
+          LOCAL_BRANCH: main
+          # Fork-only files outside .github/workflows that must survive the
+          # reset. Nothing is needed here: every workflow is preserved
+          # automatically by the .github/workflows rule below.
+          PRESERVE: |
+            .github/keepalive.txt
         run: |
+          set -euo pipefail
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git remote add upstream https://github.com/LeapYa/Rainyun-Qiandao.git 2>/dev/null || true
-          git fetch upstream main
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
 
-          LOCAL=$(git rev-parse HEAD)
-          REMOTE=$(git rev-parse upstream/main)
-          BASE=$(git merge-base HEAD upstream/main)
+          LOCAL_SHA=$(git rev-parse HEAD)
+          UPSTREAM_SHA=$(git rev-parse "upstream/${UPSTREAM_BRANCH}")
 
-          if [ "$LOCAL" = "$REMOTE" ]; then
-            echo "已是最新，无需同步"
+          echo "local    : $LOCAL_SHA"
+          echo "upstream : $UPSTREAM_SHA"
+
+          if [ "$LOCAL_SHA" = "$UPSTREAM_SHA" ]; then
+            echo "already in sync with ${UPSTREAM_REPO}@${UPSTREAM_BRANCH}"
             exit 0
           fi
 
-          if [ "$BASE" = "$LOCAL" ]; then
-            # 本地无分叉提交，直接快进
-            echo "快进合并上游更新..."
-            git merge --ff-only upstream/main
-          else
-            # 本地有分叉提交（如保活提交或用户自行修改）。
-            # 冲突时优先保留本地内容（-X ours），其余上游变更照常合入，
-            # 既不破坏 Fork 用户的本地修改，又能拿到上游的功能更新。
-            echo "本地存在分叉提交，执行合并（冲突优先保留本地）..."
-            git merge upstream/main -X ours --no-edit -m "chore: merge upstream changes [skip ci]" || {
-              echo "::warning::自动合并冲突过多，已放弃本次同步，请手动 Sync fork"
-              git merge --abort 2>/dev/null || true
-              exit 0
-            }
-          fi
+          PRESERVED=""
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            if git cat-file -e "${LOCAL_SHA}:${f}" 2>/dev/null; then
+              PRESERVED="${PRESERVED} ${f}"
+            fi
+          done <<< "$PRESERVE"
 
-          git push origin main && echo "同步完成" || echo "push 失败，等待下次运行"
+          # Builds the target tree: upstream content, plus the fork-only files,
+          # plus the fork's own .github/workflows. Runs again on retry.
+          build_tree() {
+            local base="$1"
+            local kept=""
+            local f
+
+            while IFS= read -r f; do
+              [ -n "$f" ] || continue
+              if git cat-file -e "${base}:${f}" 2>/dev/null; then
+                kept="${kept} ${f}"
+              fi
+            done <<< "$PRESERVE"
+
+            git reset --hard "$UPSTREAM_SHA"
+
+            for f in $kept; do
+              mkdir -p "$(dirname "$f")"
+              git show "${base}:${f}" > "$f"
+            done
+
+            # GITHUB_TOKEN is never allowed to push changes under
+            # .github/workflows ("without `workflows` permission"), and no
+            # permissions: key can grant it. So the fork keeps its own copy of
+            # every workflow file, byte for byte.
+            if git ls-tree -r --name-only "$base" -- .github/workflows | grep -q .; then
+              rm -rf .github/workflows
+              git checkout "$base" -- .github/workflows
+            elif git ls-tree -r --name-only "$UPSTREAM_SHA" -- .github/workflows | grep -q .; then
+              echo "::error::upstream has .github/workflows but this fork does not; GITHUB_TOKEN cannot add them"
+              exit 1
+            fi
+
+            git add -A
+            git write-tree
+          }
+
+          # Scheduled runs are routinely delayed by minutes or hours, so this can
+          # easily land while one of the repo's own jobs is pushing. The lease
+          # makes that a safe failure rather than a lost commit; retry on top of
+          # whatever the other job left behind so a collision costs nothing.
+          EXPECTED="$LOCAL_SHA"
+          for attempt in 1 2 3; do
+            NEW_TREE=$(build_tree "$EXPECTED")
+            OLD_TREE=$(git rev-parse "${EXPECTED}^{tree}")
+
+            if [ "$NEW_TREE" = "$OLD_TREE" ]; then
+              echo "content already matches upstream, nothing to push"
+              exit 0
+            fi
+
+            git commit -q -m "chore: sync with ${UPSTREAM_REPO}@${UPSTREAM_BRANCH} (${UPSTREAM_SHA:0:7})"
+
+            if git push --force-with-lease="refs/heads/${LOCAL_BRANCH}:${EXPECTED}" \
+                 origin "HEAD:${LOCAL_BRANCH}"; then
+              echo "pushed $(git rev-parse HEAD) (tree ${NEW_TREE:0:7}) after ${attempt} attempt(s)"
+              exit 0
+            fi
+
+            echo "push rejected on attempt ${attempt}: the branch moved under us"
+            git fetch -q origin "$LOCAL_BRANCH"
+            EXPECTED=$(git rev-parse "origin/${LOCAL_BRANCH}")
+          done
+
+          echo "::error::could not push after 3 attempts; the branch is being written by something else"
+          exit 1
+
+      - name: Note
+        if: always()
+        run: |
+          {
+            echo "### Synced with LeapYa/Rainyun-Qiandao"
+            echo ""
+            echo "\`.github/workflows/\` is intentionally left at this fork's version."
+            echo "To pull upstream workflow changes in, push them from your own"
+            echo "machine, where your token is allowed to write workflow files."
+          } >> "$GITHUB_STEP_SUMMARY"
